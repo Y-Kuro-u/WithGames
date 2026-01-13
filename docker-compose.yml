@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: withgames-bot
+    env_file:
+      - .env
+    environment:
+      - FIRESTORE_EMULATOR_HOST=firestore-emulator:8080
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - firestore-emulator
+    volumes:
+      - ./src:/app/src
+      - ./.env:/app/.env
+      - ./pyproject.toml:/app/pyproject.toml
+      - ./.python-version:/app/.python-version
+    restart: unless-stopped
+    networks:
+      - withgames-network
+
+  firestore-emulator:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:latest
+    container_name: withgames-firestore-emulator
+    command: gcloud beta emulators firestore start --host-port=0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    environment:
+      - FIRESTORE_PROJECT_ID=demo-project
+    networks:
+      - withgames-network
+
+networks:
+  withgames-network:
+    driver: bridge

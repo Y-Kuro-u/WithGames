@@ -1,0 +1,193 @@
+name: CD - Deploy to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+env:
+  REGION: asia-northeast1
+  SERVICE_NAME: withgames-bot
+  REPO_NAME: withgames-bot
+
+jobs:
+  deploy:
+    name: Deploy to Cloud Run
+    runs-on: ubuntu-latest
+    
+    # mainブランチへのプッシュまたは手動実行時のみデプロイ
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+      
+      - name: Determine image tag
+        id: image_tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG=$(git rev-parse --short HEAD)
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Using tag: $TAG"
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.SERVICE_NAME }}:${{ steps.image_tag.outputs.tag }}
+            ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.SERVICE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image=${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.SERVICE_NAME }}:${{ steps.image_tag.outputs.tag }} \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --service-account=withgames-bot-sa@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com \
+            --set-env-vars="ENVIRONMENT=production,GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }},REMINDER_MINUTES=30" \
+            --set-secrets="DISCORD_TOKEN=discord-bot-token:latest,DISCORD_APPLICATION_ID=discord-app-id:latest,EVENT_WEBHOOK_URL=event-webhook-url:latest" \
+            --cpu=1 \
+            --memory=512Mi \
+            --min-instances=1 \
+            --max-instances=2 \
+            --cpu-boost \
+            --no-allow-unauthenticated \
+            --timeout=60s \
+            --concurrency=80 \
+            --quiet
+      
+      - name: Get service URL
+        id: service_url
+        run: |
+          URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region=${{ env.REGION }} \
+            --format="value(status.url)")
+          echo "url=$URL" >> $GITHUB_OUTPUT
+      
+      - name: Verify deployment
+        run: |
+          echo "Deployment completed successfully!"
+          echo "Service URL: ${{ steps.service_url.outputs.url }}"
+          echo "Image: ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.SERVICE_NAME }}:${{ steps.image_tag.outputs.tag }}"
+          
+          # ログを表示（最新20行）
+          echo "Recent logs:"
+          gcloud run logs read ${{ env.SERVICE_NAME }} \
+            --region=${{ env.REGION }} \
+            --limit=20
+      
+      - name: Create deployment summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          # 🚀 Deployment Summary
+          
+          ## Service Information
+          - **Service**: ${{ env.SERVICE_NAME }}
+          - **Region**: ${{ env.REGION }}
+          - **Image Tag**: ${{ steps.image_tag.outputs.tag }}
+          - **Commit**: ${{ github.sha }}
+          
+          ## Deployment Details
+          - **Service URL**: ${{ steps.service_url.outputs.url }}
+          - **Console**: [View in Cloud Console](https://console.cloud.google.com/run/detail/${{ env.REGION }}/${{ env.SERVICE_NAME }}?project=${{ secrets.GCP_PROJECT_ID }})
+          - **Logs**: \`gcloud run logs tail ${{ env.SERVICE_NAME }} --region=${{ env.REGION }}\`
+          
+          ## Image
+          \`\`\`
+          ${{ env.REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.SERVICE_NAME }}:${{ steps.image_tag.outputs.tag }}
+          \`\`\`
+          EOF
+      
+      - name: Notify deployment status (Success)
+        if: success()
+        run: |
+          echo "✅ Deployment succeeded for ${{ env.SERVICE_NAME }}"
+          # ここにSlack/Discord通知を追加できます
+      
+      - name: Notify deployment status (Failure)
+        if: failure()
+        run: |
+          echo "❌ Deployment failed for ${{ env.SERVICE_NAME }}"
+          # ここにSlack/Discord通知を追加できます
+
+  rollback:
+    name: Rollback (Manual)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'rollback'
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: List revisions
+        run: |
+          echo "Available revisions:"
+          gcloud run revisions list \
+            --service=${{ env.SERVICE_NAME }} \
+            --region=${{ env.REGION }} \
+            --format="table(name,status,trafficPercent)"
+      
+      - name: Rollback to previous revision
+        run: |
+          # 最新のリビジョンの1つ前のリビジョンを取得
+          PREVIOUS_REVISION=$(gcloud run revisions list \
+            --service=${{ env.SERVICE_NAME }} \
+            --region=${{ env.REGION }} \
+            --format="value(name)" \
+            --limit=2 | tail -n 1)
+          
+          echo "Rolling back to: $PREVIOUS_REVISION"
+          
+          gcloud run services update-traffic ${{ env.SERVICE_NAME }} \
+            --to-revisions=$PREVIOUS_REVISION=100 \
+            --region=${{ env.REGION }}
+          
+          echo "✅ Rollback completed to $PREVIOUS_REVISION"
